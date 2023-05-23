@@ -1,0 +1,225 @@
+library(nflverse)
+library(tidyverse)
+library(gt)
+library(gtExtras)
+
+YEAR <- 2023
+
+sched_raw <- load_schedules(seasons = YEAR)
+
+teams <- unique(sort(sched_raw$home_team))
+
+matrix1 <- sched_raw |> 
+  select(game_id, home_team, away_team) |> 
+  mutate(teams = home_team) |> 
+  mutate(away = away_team) |> 
+  complete(game_id, teams) |> 
+  group_by(game_id) |> 
+  fill(away, .direction = "downup") |> 
+  ungroup() |> 
+  mutate(home_away = case_when(
+    home_team == teams ~ 1, 
+    away == teams ~ -1, 
+    TRUE ~ 0
+  )) |> 
+  select(game_id, teams, home_away) |> 
+  pivot_wider(names_from = teams, values_from = home_away)
+
+
+matrix <- matrix1 |> 
+  left_join(select(sched_raw, game_id, spread_line, location), by = "game_id") |> 
+  mutate(loc = if_else(location == "Home", 1, 0)) |> 
+  mutate(y = row_number(), .before = "game_id") |> 
+  select(-game_id, -location)
+
+# Models-----
+
+linear_model <- lm(spread_line ~ ., data = matrix)
+model_output <- rownames_to_column(as.data.frame(summary(linear_model)$coefficients), "team")
+
+model1 <- model_output |> 
+  filter(!team %in% c("(Intercept)","y", "loc")) |> 
+  add_row(team = "WAS", Estimate = 0)
+
+avg_estimate <- mean(model1$Estimate)
+
+model <- model1 |> 
+  mutate(rating = Estimate - avg_estimate, .after = Estimate) |> 
+  select(team, rating)
+
+# Data ----- 
+
+sos1 <- sched_raw |> 
+  select(game_id, week, home_team, away_team, spread_line, location) |> 
+  clean_homeaway(invert = "spread_line") |> 
+  left_join(model, by = "team") |> 
+  rename(team_rating = rating) |> 
+  left_join(model, by = c("opponent" = "team")) |> 
+  rename(opp_rating = rating) |> 
+  mutate(team_rating_homeaway = case_when(
+    location == "home" ~ team_rating - 1, 
+    location == "away" ~ team_rating + 1, 
+    TRUE ~ team_rating)) |> 
+  mutate(opp_rating_homeaway = case_when(
+    location == "home" ~ opp_rating - 1, 
+    location == "away" ~ opp_rating + 1, 
+    TRUE ~ opp_rating)) |> 
+  mutate(abv_avg = if_else(opp_rating > 0, 1, 0))
+
+sos2 <- sos1 |> 
+  group_by(team) |> 
+  summarize(team_total = sum(team_rating_homeaway), 
+            team_avg = mean(team_rating_homeaway), 
+            team_median = median(team_rating_homeaway), 
+            opp_total = sum(opp_rating_homeaway), 
+            opp_avg = mean(opp_rating_homeaway), 
+            opp_median = median(opp_rating_homeaway)) |> 
+  mutate(avg_diff = team_avg - opp_avg)
+
+sos <- left_join(sos1, sos2, by = "team")
+
+ratings <- sos2 |> 
+  left_join(load_teams(), by = c("team" = "team_abbr")) |> 
+  select(team_logo_espn, team_avg, opp_avg) |> 
+  arrange(-team_avg) |> 
+  mutate(rank = row_number(), .before = team_logo_espn)
+
+split1 <- ratings |> 
+  head(16)
+colnames(split1) <- paste(colnames(split1), "1", sep = "")
+
+split2 <- ratings |> 
+  tail(16)
+colnames(split2) <- paste(colnames(split2), "2", sep = "")
+
+final <- bind_cols(split1, split2)
+
+# Plot-----
+
+#boxplot
+(
+  p <- 
+    ggplot(sos, aes(x = opp_rating_homeaway, y = reorder(team, opp_avg), color = team)) + 
+    #ggplot(df, aes(x = opp_rating_homeaway, y = team, color = team)) + 
+    geom_boxplot(outlier.shape = NA) + 
+    geom_point(alpha = 0.2, position = "jitter") +
+    #geom_nfl_logos(mapping = aes(x = opp_avg, y = team, team_abbr = team, color = NULL), width = 0.05) + 
+    geom_point(mapping = aes(x = opp_avg, y = team, color = team), size = 1.5) + 
+    scale_x_continuous(breaks = c(-6, -4, -2, 0, 2, 4, 6), labels = c(-6, -4, -2, 0, 2, 4, 6)) +
+    scale_color_nfl(type = "primary") +
+    labs(
+      title = "NFL Strength of Schedule",
+      subtitle = "Per DraftKings Point Spreads", 
+      caption = "Data: nflverse.com",
+      x = "Opponent Points Above Avg (HFA = +1)", 
+      y = ""
+    ) + 
+    theme_minimal() +
+    theme(
+      #axis.title.x = element_blank(), 
+      #axis.text.y = element_nfl_logo(size = 0.5), 
+      #axis.ticks.y = element_line(), 
+      plot.background = element_rect(fill = "white"), 
+      legend.position = "none", 
+      #panel.grid.major.x = element_blank(), 
+      panel.grid.minor.x = element_blank(), 
+      plot.title = element_text(hjust = 0.5), 
+      plot.subtitle = element_text(hjust = 0.5), 
+      plot.margin = unit(c(3,3,10,3), units = "mm")
+    )
+)
+
+ggsave(plot = p, 
+       filename = "images/Strength of Schedule.png", 
+       #height = 6.25, 
+       #width = 10
+)
+
+# Table-----
+
+(
+  tab <- 
+    gt(final) |> 
+    gt_theme_538() |> 
+    gt_img_rows(team_logo_espn1) |> 
+    gt_img_rows(team_logo_espn2) |>  
+    gt_hulk_col_numeric(
+      columns = c("team_avg1", "team_avg2"),
+      domain = range(c(final$team_avg1, final$team_avg2))
+    ) |>  
+    gt_hulk_col_numeric(
+      columns = c("opp_avg1", "opp_avg2"),
+      domain = range(c(final$opp_avg1, final$opp_avg2)), 
+      #reverse = TRUE
+    ) |>  
+    cols_label(rank1 = "", 
+               rank2 = "", 
+               team_logo_espn1 = "", 
+               team_logo_espn2 = "", 
+               team_avg1 = "team", 
+               team_avg2 = "team", 
+               opp_avg1 = "opp", 
+               opp_avg2 = "opp"
+    ) |> 
+    # Header text and format
+    tab_header(title = "Team and Opponent Spread Ratings", 
+               subtitle = "Per DraftKings point spreads, May 19, 2023") |> 
+    tab_style(
+      style = list(
+        cell_text(weight = "bold", 
+                  align = "center")
+      ),
+      locations = cells_title(groups = c("title", "subtitle"))
+    ) |> 
+    tab_spanner(
+      label = "Avg Spread Rating", 
+      columns = c("team_avg1":"opp_avg1")
+    ) |> 
+    tab_spanner(
+      label = "Avg Spread Rating ", 
+      columns = c("team_avg2":"opp_avg2")
+    ) |> 
+    # Column Label format
+    tab_style(
+      style = cell_text(align = "center"),
+      locations = cells_column_labels(rank1:opp_avg2)
+    ) |>
+    tab_style(
+      style = cell_text(weight = "bold"), 
+      locations = cells_body(c(rank1, rank2))
+    ) |> 
+    tab_style(
+      style = cell_text(indent = px(15)), 
+      locations = cells_body(columns = rank2)
+    ) |>
+    fmt_number(
+      columns = c(3, 4, 7, 8),
+      decimals = 2
+    ) |>
+    # Add Footnote and top and bottom borders around footnote
+    tab_footnote(
+      footnote = "Average spread rating of all opponents faced",
+      locations = cells_column_labels(
+        columns = c(opp_avg1, opp_avg2)
+      )
+    ) |>
+    tab_style(
+      style = list(
+        cell_borders(
+          side = c("top", "bottom"),
+          color = "grey50",
+          weight = px(1)
+        ),
+        cell_text(style = "italic")
+      ),
+      locations = cells_footnotes()
+    ) |>
+    tab_source_note(
+      source_note = "Data: nflverse.com"
+    )
+)
+
+gtsave(tab, 
+       path = "./images", 
+       filename = "Team Spread Ratings.png", 
+       expand = 10)
